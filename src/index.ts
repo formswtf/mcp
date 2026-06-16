@@ -6,8 +6,8 @@
  * etc.) can build, manage, and analyze Web3 forms in natural language.
  *
  * Config (environment variables):
- *   FORMS_WTF_API_KEY   required — a fwtf_ key from forms.wtf → Settings → API
- *   FORMS_WTF_API_URL   optional — base URL (default https://forms.wtf)
+ *   FORMS_WTF_API_KEY   required: a fwtf_ key from forms.wtf → Settings → API
+ *   FORMS_WTF_API_URL   optional: base URL (default https://forms.wtf)
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";

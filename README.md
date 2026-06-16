@@ -40,7 +40,7 @@ npx @formswtf/mcp
 
 | Env var | Required | Default | Description |
 |---|---|---|---|
-| `FORMS_WTF_API_KEY` | yes | — | Your `fwtf_` API key |
+| `FORMS_WTF_API_KEY` | yes | n/a | Your `fwtf_` API key |
 | `FORMS_WTF_API_URL` | no | `https://forms.wtf` | Override the API base URL (self-host/staging) |
 
 ## Tools

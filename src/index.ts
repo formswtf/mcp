@@ -13,13 +13,45 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-const API_URL = (process.env.FORMS_WTF_API_URL || "https://forms.wtf").replace(/\/$/, "");
+const OFFICIAL_API_URL = "https://forms.wtf";
+const API_URL = (process.env.FORMS_WTF_API_URL || OFFICIAL_API_URL).replace(/\/$/, "");
 const API_KEY = process.env.FORMS_WTF_API_KEY;
 
 if (!API_KEY) {
   console.error("[forms-wtf-mcp] FORMS_WTF_API_KEY environment variable is required.");
-  console.error("Create a key at " + API_URL + "/dashboard/settings/api");
+  console.error("Create a key at " + OFFICIAL_API_URL + "/dashboard/settings/api");
   process.exit(1);
+}
+
+// The API key is sent as a Bearer token to API_URL on every request, so the
+// host must be trusted. Require HTTPS (or localhost for dev) and fail closed
+// otherwise; warn loudly if pointed at a non-official host.
+const isLocalhost = /^http:\/\/localhost(:\d+)?$/.test(API_URL);
+if (!/^https:\/\//.test(API_URL) && !isLocalhost) {
+  console.error(
+    `[forms-wtf-mcp] Refusing to use FORMS_WTF_API_URL="${API_URL}": it must use https:// ` +
+      `(your API key is transmitted to this host).`
+  );
+  process.exit(1);
+}
+if (API_URL !== OFFICIAL_API_URL && !isLocalhost) {
+  console.error(
+    `[forms-wtf-mcp] WARNING: using non-default API host "${API_URL}". Your fwtf_ API key will be sent there. ` +
+      `Only set FORMS_WTF_API_URL to a host you trust.`
+  );
+}
+
+// Build a v1 path from untrusted (LLM-supplied) segments. Encodes each segment
+// and rejects traversal/separator characters so a tool can't be coerced into
+// hitting a different route than its name implies.
+function seg(value: unknown): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error("Invalid path parameter");
+  }
+  if (value === "." || value === ".." || /[/?#\\]/.test(value)) {
+    throw new Error(`Invalid path parameter: "${value}"`);
+  }
+  return encodeURIComponent(value);
 }
 
 const QUESTION_TYPES = [
@@ -115,7 +147,7 @@ server.tool(
   "get_form",
   "Get one form in full, including its questions and token-gate rules.",
   { formId: z.string() },
-  ({ formId }) => run(() => api(`/forms/${formId}`))
+  ({ formId }) => run(() => api(`/forms/${seg(formId)}`))
 );
 
 server.tool("get_account", "Get your current plan, limits, and usage (forms, AI generations).", () =>
@@ -150,28 +182,28 @@ server.tool(
     questions: z.array(questionShape).optional(),
     gateRules: z.array(gateRuleShape).nullable().optional(),
   },
-  ({ formId, ...body }) => run(() => api(`/forms/${formId}`, { method: "PUT", body: JSON.stringify(body) }))
+  ({ formId, ...body }) => run(() => api(`/forms/${seg(formId)}`, { method: "PUT", body: JSON.stringify(body) }))
 );
 
 server.tool(
   "publish_form",
   "Publish a form so it accepts responses.",
   { formId: z.string() },
-  ({ formId }) => run(() => api(`/forms/${formId}`, { method: "PUT", body: JSON.stringify({ published: true }) }))
+  ({ formId }) => run(() => api(`/forms/${seg(formId)}`, { method: "PUT", body: JSON.stringify({ published: true }) }))
 );
 
 server.tool(
   "unpublish_form",
   "Unpublish a form (stops accepting responses).",
   { formId: z.string() },
-  ({ formId }) => run(() => api(`/forms/${formId}`, { method: "PUT", body: JSON.stringify({ published: false }) }))
+  ({ formId }) => run(() => api(`/forms/${seg(formId)}`, { method: "PUT", body: JSON.stringify({ published: false }) }))
 );
 
 server.tool(
   "delete_form",
   "Permanently delete a form and all its responses.",
   { formId: z.string() },
-  ({ formId }) => run(() => api(`/forms/${formId}`, { method: "DELETE" }))
+  ({ formId }) => run(() => api(`/forms/${seg(formId)}`, { method: "DELETE" }))
 );
 
 server.tool(
@@ -183,7 +215,7 @@ server.tool(
     rules: z.array(gateRuleShape),
   },
   ({ formId, gateLogic, rules }) =>
-    run(() => api(`/forms/${formId}`, { method: "PUT", body: JSON.stringify({ gateRules: rules, ...(gateLogic ? { gateLogic } : {}) }) }))
+    run(() => api(`/forms/${seg(formId)}`, { method: "PUT", body: JSON.stringify({ gateRules: rules, ...(gateLogic ? { gateLogic } : {}) }) }))
 );
 
 // --- Responses / analytics ---
@@ -196,7 +228,7 @@ server.tool(
     if (page) qs.set("page", String(page));
     if (limit) qs.set("limit", String(limit));
     const q = qs.toString();
-    return run(() => api(`/forms/${formId}/responses${q ? `?${q}` : ""}`));
+    return run(() => api(`/forms/${seg(formId)}/responses${q ? `?${q}` : ""}`));
   }
 );
 
@@ -204,14 +236,14 @@ server.tool(
   "get_form_analytics",
   "Get view, start, completion, and response metrics for a form.",
   { formId: z.string() },
-  ({ formId }) => run(() => api(`/forms/${formId}/analytics`))
+  ({ formId }) => run(() => api(`/forms/${seg(formId)}/analytics`))
 );
 
 server.tool(
   "export_responses_csv",
   "Export all responses for a form as CSV text.",
   { formId: z.string() },
-  ({ formId }) => run(() => apiText(`/forms/${formId}/export`))
+  ({ formId }) => run(() => apiText(`/forms/${seg(formId)}/export`))
 );
 
 // --- Webhooks ---
@@ -219,21 +251,21 @@ server.tool(
   "list_webhooks",
   "List webhooks configured on a form.",
   { formId: z.string() },
-  ({ formId }) => run(() => api(`/forms/${formId}/webhooks`))
+  ({ formId }) => run(() => api(`/forms/${seg(formId)}/webhooks`))
 );
 
 server.tool(
   "create_webhook",
   "Add a webhook to a form (requires the webhooks feature / Team+ plan). Fires on each submission.",
   { formId: z.string(), url: z.string().url(), secret: z.string().optional(), enabled: z.boolean().optional() },
-  ({ formId, ...body }) => run(() => api(`/forms/${formId}/webhooks`, { method: "POST", body: JSON.stringify(body) }))
+  ({ formId, ...body }) => run(() => api(`/forms/${seg(formId)}/webhooks`, { method: "POST", body: JSON.stringify(body) }))
 );
 
 server.tool(
   "delete_webhook",
   "Remove a webhook from a form.",
   { formId: z.string(), webhookId: z.string() },
-  ({ formId, webhookId }) => run(() => api(`/forms/${formId}/webhooks/${webhookId}`, { method: "DELETE" }))
+  ({ formId, webhookId }) => run(() => api(`/forms/${seg(formId)}/webhooks/${seg(webhookId)}`, { method: "DELETE" }))
 );
 
 // --- Utilities ---
@@ -241,7 +273,7 @@ server.tool(
   "resolve_ens",
   "Reverse-resolve an EVM wallet address to its primary ENS name (or null).",
   { address: z.string() },
-  ({ address }) => run(() => api(`/ens/${address}`))
+  ({ address }) => run(() => api(`/ens/${seg(address)}`))
 );
 
 async function main() {

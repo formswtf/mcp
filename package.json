@@ -1,6 +1,6 @@
 {
   "name": "@formswtf/mcp",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Model Context Protocol server for forms.wtf: build, manage, and analyze Web3 forms from any MCP client (Claude Desktop, Cursor, etc.).",
   "license": "MIT",
   "homepage": "https://github.com/formswtf/mcp#readme",

@@ -139,13 +139,13 @@ const gateRuleShape = z.object({
 const server = new McpServer({ name: "forms-wtf", version: "0.1.0" });
 
 // --- Forms: read ---
-server.tool("list_forms", "List all of your forms (id, title, slug, published, response count).", () =>
+server.tool("list_forms", "List all of your forms (id, title, slug, public url, published, response count).", () =>
   run(() => api("/forms"))
 );
 
 server.tool(
   "get_form",
-  "Get one form in full, including its questions and token-gate rules.",
+  "Get one form in full: title, description, published state, public url (https://forms.wtf/f/<slug>), all questions, and token-gate rules.",
   { formId: z.string() },
   ({ formId }) => run(() => api(`/forms/${seg(formId)}`))
 );

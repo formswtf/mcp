@@ -1,7 +1,7 @@
 {
   "name": "@formswtf/mcp",
-  "version": "0.1.2",
-  "description": "Model Context Protocol server for forms.wtf: build, manage, and analyze Web3 forms from any MCP client (Claude Desktop, Cursor, etc.).",
+  "version": "0.2.0",
+  "description": "Model Context Protocol server for forms.wtf: build, manage and analyze forms (conversational or classic) from any MCP client. Bridges to the hosted forms.wtf MCP server, so tools always match the live app.",
   "license": "MIT",
   "homepage": "https://github.com/formswtf/mcp#readme",
   "repository": {
@@ -36,8 +36,7 @@
     "claude"
   ],
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.18.0",
-    "zod": "^3.23.8"
+    "@modelcontextprotocol/sdk": "^1.29.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

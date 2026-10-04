@@ -2,16 +2,29 @@
 /**
  * forms.wtf MCP server (stdio).
  *
- * Wraps the forms.wtf v1 REST API so any MCP client (Claude Desktop, Cursor,
- * etc.) can build, manage, and analyze Web3 forms in natural language.
+ * A thin bridge: desktop and editor MCP clients (Claude Desktop, Claude Code,
+ * Cursor, Codex, VS Code) talk to this process over stdio, and every request
+ * is forwarded to the hosted forms.wtf MCP server at https://forms.wtf/api/mcp.
+ * The tool list therefore always matches the live app: new features show up
+ * without a new release of this package.
  *
  * Config (environment variables):
  *   FORMS_WTF_API_KEY   required: a fwtf_ key from forms.wtf → Settings → API
  *   FORMS_WTF_API_URL   optional: base URL (default https://forms.wtf)
  */
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { z } from "zod";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+  McpError,
+  type CallToolResult,
+} from "@modelcontextprotocol/sdk/types.js";
+import { createRequire } from "node:module";
+
+const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
 
 const OFFICIAL_API_URL = "https://forms.wtf";
 const API_URL = (process.env.FORMS_WTF_API_URL || OFFICIAL_API_URL).replace(/\/$/, "");
@@ -41,248 +54,98 @@ if (API_URL !== OFFICIAL_API_URL && !isLocalhost) {
   );
 }
 
-// Build a v1 path from untrusted (LLM-supplied) segments. Encodes each segment
-// and rejects traversal/separator characters so a tool can't be coerced into
-// hitting a different route than its name implies.
-function seg(value: unknown): string {
-  if (typeof value !== "string" || value.length === 0) {
-    throw new Error("Invalid path parameter");
+const ENDPOINT = new URL("/api/mcp", API_URL);
+
+// ── Connection to the hosted server ─────────────────────────────────────
+// Connected on first use and reused. If a request fails because the
+// connection dropped, the next request reconnects.
+
+let remote: Promise<Client> | null = null;
+
+function connectRemote(): Promise<Client> {
+  if (!remote) {
+    remote = (async () => {
+      const client = new Client({ name: "forms-wtf-mcp-bridge", version: pkg.version });
+      const transport = new StreamableHTTPClientTransport(ENDPOINT, {
+        requestInit: { headers: { Authorization: `Bearer ${API_KEY}` } },
+      });
+      await client.connect(transport);
+      return client;
+    })();
+    remote.catch(() => {
+      remote = null;
+    });
   }
-  if (value === "." || value === ".." || /[/?#\\]/.test(value)) {
-    throw new Error(`Invalid path parameter: "${value}"`);
-  }
-  return encodeURIComponent(value);
+  return remote;
 }
 
-const QUESTION_TYPES = [
-  "SHORT_TEXT", "LONG_TEXT", "MULTIPLE_CHOICE", "EMAIL", "PHONE", "URL", "NUMBER",
-  "DATE", "YES_NO", "DROPDOWN", "RATING", "OPINION_SCALE", "NPS", "LEGAL", "CHECKBOX",
-  "STATEMENT", "WELCOME_SCREEN", "END_SCREEN", "WALLET_ADDRESS", "ENS_NAME", "FILE_UPLOAD",
-] as const;
+/** Turn a transport/HTTP failure into a message a person can act on. */
+function explain(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/\b401\b|unauthori[sz]ed|invalid_token/i.test(msg)) {
+    return `forms.wtf rejected the API key. Check FORMS_WTF_API_KEY (create one at ${OFFICIAL_API_URL}/dashboard/settings/api).`;
+  }
+  if (/\b429\b|rate limit/i.test(msg)) return "forms.wtf rate limit reached. Wait a minute and try again.";
+  if (/fetch failed|ENOTFOUND|ECONNREFUSED|ETIMEDOUT|network/i.test(msg)) {
+    return `Couldn't reach ${ENDPOINT.origin}. Check your internet connection.`;
+  }
+  return msg;
+}
 
-type Json = Record<string, unknown>;
-
-async function api(path: string, init: RequestInit = {}): Promise<unknown> {
-  const res = await fetch(`${API_URL}/api/v1${path}`, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${API_KEY}`,
-      "Content-Type": "application/json",
-      ...(init.headers || {}),
-    },
-  });
-  const text = await res.text();
-  let data: unknown;
+/** Run a request against the hosted server, reconnecting once if the connection went stale. */
+async function withRemote<T>(fn: (client: Client) => Promise<T>): Promise<T> {
   try {
-    data = text ? JSON.parse(text) : {};
-  } catch {
-    data = { raw: text };
-  }
-  if (!res.ok) {
-    const msg = (data as Json)?.error ?? `Request failed (HTTP ${res.status})`;
-    throw new Error(String(msg));
-  }
-  return data;
-}
-
-async function apiText(path: string): Promise<string> {
-  const res = await fetch(`${API_URL}/api/v1${path}`, {
-    headers: { Authorization: `Bearer ${API_KEY}` },
-  });
-  const text = await res.text();
-  if (!res.ok) {
-    let msg = `Request failed (HTTP ${res.status})`;
+    return await fn(await connectRemote());
+  } catch (err) {
+    // The server answered with an error (bad arguments, unknown tool...): it
+    // handled the request, so never send it again.
+    if (err instanceof McpError) throw err;
+    // Connection-level failure (server restart, expired session, network):
+    // reconnect and retry once.
+    remote = null;
     try {
-      msg = JSON.parse(text).error || msg;
+      return await fn(await connectRemote());
     } catch {
-      /* keep default */
+      throw new Error(explain(err));
     }
-    throw new Error(msg);
   }
-  return text;
 }
 
-type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
+// ── Local stdio server ──────────────────────────────────────────────────
 
-function ok(data: unknown): ToolResult {
-  return { content: [{ type: "text", text: typeof data === "string" ? data : JSON.stringify(data, null, 2) }] };
-}
-function fail(e: unknown): ToolResult {
-  return { content: [{ type: "text", text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
-}
-async function run(fn: () => Promise<unknown>): Promise<ToolResult> {
+const server = new Server(
+  { name: "forms-wtf", version: pkg.version },
+  {
+    capabilities: { tools: {} },
+    instructions:
+      "Build, manage and analyze forms.wtf forms: conversational (one question at a time) or classic (all fields on one page), " +
+      "with token gating, hidden fields, AI generation, responses, analytics and webhooks. Tools mirror the live forms.wtf app.",
+  }
+);
+
+server.setRequestHandler(ListToolsRequestSchema, async (request) => {
+  return withRemote((client) => client.listTools(request.params));
+});
+
+server.setRequestHandler(CallToolRequestSchema, async (request): Promise<CallToolResult> => {
   try {
-    return ok(await fn());
-  } catch (e) {
-    return fail(e);
+    return (await withRemote((client) => client.callTool(request.params))) as CallToolResult;
+  } catch (err) {
+    // Report as a tool error so the assistant can tell the user what went wrong.
+    return { content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }], isError: true };
   }
-}
-
-const questionShape = z.object({
-  id: z.string().optional().describe("Existing question id to update; omit to create"),
-  type: z.enum(QUESTION_TYPES),
-  label: z.string(),
-  description: z.string().optional(),
-  required: z.boolean().optional(),
-  order: z.number().int().min(0),
-  options: z.array(z.string()).optional().describe("For MULTIPLE_CHOICE / DROPDOWN / CHECKBOX"),
-  emailVerify: z.boolean().optional().describe("For EMAIL: require OTP verification"),
 });
 
-const gateRuleShape = z.object({
-  chain: z.string().optional().describe("default 'ethereum'"),
-  contractAddress: z.string(),
-  tokenType: z.enum(["ERC20", "ERC721", "ERC1155"]).optional(),
-  minBalance: z.string().optional(),
-});
-
-const server = new McpServer({ name: "forms-wtf", version: "0.1.0" });
-
-// --- Forms: read ---
-server.tool("list_forms", "List all of your forms (id, title, slug, public url, published, response count).", () =>
-  run(() => api("/forms"))
-);
-
-server.tool(
-  "get_form",
-  "Get one form in full: title, description, published state, public url (https://forms.wtf/f/<slug>), all questions, and token-gate rules.",
-  { formId: z.string() },
-  ({ formId }) => run(() => api(`/forms/${seg(formId)}`))
-);
-
-server.tool("get_account", "Get your current plan, limits, and usage (forms, AI generations).", () =>
-  run(() => api("/account"))
-);
-
-// --- Forms: create / generate / update / delete ---
-server.tool(
-  "create_form",
-  "Create a new empty form. Add questions with update_form afterwards.",
-  { title: z.string().min(1).max(200), description: z.string().max(1000).optional() },
-  (args) => run(() => api("/forms", { method: "POST", body: JSON.stringify(args) }))
-);
-
-server.tool(
-  "generate_form",
-  "Generate a complete form from a natural-language description using AI. Set create=true to save it immediately (consumes one AI generation either way).",
-  { prompt: z.string().min(10).max(2000), create: z.boolean().optional() },
-  (args) => run(() => api("/forms/generate", { method: "POST", body: JSON.stringify(args) }))
-);
-
-server.tool(
-  "update_form",
-  "Update a form. Provide only the fields you want to change. Passing `questions` replaces the full question list (include existing ids to preserve them).",
-  {
-    formId: z.string(),
-    title: z.string().max(200).optional(),
-    description: z.string().max(1000).nullable().optional(),
-    published: z.boolean().optional(),
-    slug: z.string().optional().describe("Custom slug (Pro+ only)"),
-    gateLogic: z.enum(["AND", "OR"]).optional(),
-    questions: z.array(questionShape).optional(),
-    gateRules: z.array(gateRuleShape).nullable().optional(),
-  },
-  ({ formId, ...body }) => run(() => api(`/forms/${seg(formId)}`, { method: "PUT", body: JSON.stringify(body) }))
-);
-
-server.tool(
-  "publish_form",
-  "Publish a form so it accepts responses.",
-  { formId: z.string() },
-  ({ formId }) => run(() => api(`/forms/${seg(formId)}`, { method: "PUT", body: JSON.stringify({ published: true }) }))
-);
-
-server.tool(
-  "unpublish_form",
-  "Unpublish a form (stops accepting responses).",
-  { formId: z.string() },
-  ({ formId }) => run(() => api(`/forms/${seg(formId)}`, { method: "PUT", body: JSON.stringify({ published: false }) }))
-);
-
-server.tool(
-  "delete_form",
-  "Permanently delete a form and all its responses.",
-  { formId: z.string() },
-  ({ formId }) => run(() => api(`/forms/${seg(formId)}`, { method: "DELETE" }))
-);
-
-server.tool(
-  "set_token_gate",
-  "Set the token-gate rules for a form (ERC20/721/1155 balance checks). Replaces existing rules.",
-  {
-    formId: z.string(),
-    gateLogic: z.enum(["AND", "OR"]).optional(),
-    rules: z.array(gateRuleShape),
-  },
-  ({ formId, gateLogic, rules }) =>
-    run(() => api(`/forms/${seg(formId)}`, { method: "PUT", body: JSON.stringify({ gateRules: rules, ...(gateLogic ? { gateLogic } : {}) }) }))
-);
-
-// --- Responses / analytics ---
-server.tool(
-  "list_responses",
-  "List responses for a form (paginated, newest first).",
-  { formId: z.string(), page: z.number().int().min(1).optional(), limit: z.number().int().min(1).max(100).optional() },
-  ({ formId, page, limit }) => {
-    const qs = new URLSearchParams();
-    if (page) qs.set("page", String(page));
-    if (limit) qs.set("limit", String(limit));
-    const q = qs.toString();
-    return run(() => api(`/forms/${seg(formId)}/responses${q ? `?${q}` : ""}`));
+const shutdown = async () => {
+  try {
+    const client = remote ? await remote : null;
+    await client?.close();
+  } catch {
+    // exiting anyway
   }
-);
+  process.exit(0);
+};
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
 
-server.tool(
-  "get_form_analytics",
-  "Get view, start, completion, and response metrics for a form.",
-  { formId: z.string() },
-  ({ formId }) => run(() => api(`/forms/${seg(formId)}/analytics`))
-);
-
-server.tool(
-  "export_responses_csv",
-  "Export all responses for a form as CSV text.",
-  { formId: z.string() },
-  ({ formId }) => run(() => apiText(`/forms/${seg(formId)}/export`))
-);
-
-// --- Webhooks ---
-server.tool(
-  "list_webhooks",
-  "List webhooks configured on a form.",
-  { formId: z.string() },
-  ({ formId }) => run(() => api(`/forms/${seg(formId)}/webhooks`))
-);
-
-server.tool(
-  "create_webhook",
-  "Add a webhook to a form (requires the webhooks feature / Team+ plan). Fires on each submission.",
-  { formId: z.string(), url: z.string().url(), secret: z.string().optional(), enabled: z.boolean().optional() },
-  ({ formId, ...body }) => run(() => api(`/forms/${seg(formId)}/webhooks`, { method: "POST", body: JSON.stringify(body) }))
-);
-
-server.tool(
-  "delete_webhook",
-  "Remove a webhook from a form.",
-  { formId: z.string(), webhookId: z.string() },
-  ({ formId, webhookId }) => run(() => api(`/forms/${seg(formId)}/webhooks/${seg(webhookId)}`, { method: "DELETE" }))
-);
-
-// --- Utilities ---
-server.tool(
-  "resolve_ens",
-  "Reverse-resolve an EVM wallet address to its primary ENS name (or null).",
-  { address: z.string() },
-  ({ address }) => run(() => api(`/ens/${seg(address)}`))
-);
-
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error(`[forms-wtf-mcp] connected (API: ${API_URL})`);
-}
-
-main().catch((e) => {
-  console.error("[forms-wtf-mcp] fatal:", e);
-  process.exit(1);
-});
+await server.connect(new StdioServerTransport());
